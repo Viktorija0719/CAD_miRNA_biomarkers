@@ -1,0 +1,352 @@
+configfile: "config.yaml"
+
+ruleorder: fastqc > multiqc > prepare_mirdeep_ref > process_miRNA_files > mirdeep2_mapper > run_miRDeep2 > organize_mirdeep2_outputs
+
+
+########################################
+# NEW: automatic reference downloads
+########################################
+
+# Download and decompress the human genome FASTA if missing
+rule download_genome:
+    output:
+        ref_fa = config["files"]["ref_file"]
+    # You can override these in config.yaml under `urls:`
+    params:
+        url = config.get("urls", {}).get(
+            "ref_file",
+            # Example: Ensembl GRCh38 primary assembly FASTA (release 109)
+            "ftp://ftp.ensembl.org/pub/release-109/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz"
+        )
+    shell:
+        """
+        mkdir -p "$(dirname {output.ref_fa})"
+        if [ ! -f "{output.ref_fa}" ]; then
+            echo "Downloading genome FASTA from {params.url}"
+            tmp_gz="{output.ref_fa}.gz"
+            wget -O "$tmp_gz" "{params.url}"
+            gunzip -c "$tmp_gz" > "{output.ref_fa}"
+            rm "$tmp_gz"
+        else
+            echo "Genome FASTA {output.ref_fa} already exists, skipping download."
+        fi
+        """
+
+
+# Download miRBase hairpin.fa and mature.fa if missing
+rule download_mirbase:
+    output:
+        hairpin = f"{config['directories']['hsa_ref']}/{config['files']['hairpin']}",
+        mature  = f"{config['directories']['hsa_ref']}/{config['files']['mature']}"
+    params:
+        hairpin_url = config.get("urls", {}).get(
+            "hairpin",
+            "https://mirbase.org/download/hairpin.fa"
+        ),
+        mature_url  = config.get("urls", {}).get(
+            "mature",
+            "https://mirbase.org/download/mature.fa"
+        )
+    shell:
+        """
+        mkdir -p "$(dirname {output.hairpin})"
+
+        if [ ! -f "{output.hairpin}" ]; then
+            echo "Downloading hairpin.fa from {params.hairpin_url}"
+            wget -O "{output.hairpin}" "{params.hairpin_url}"
+        else
+            echo "Hairpin file {output.hairpin} already exists, skipping."
+        fi
+
+        if [ ! -f "{output.mature}" ]; then
+            echo "Downloading mature.fa from {params.mature_url}"
+            wget -O "{output.mature}" "{params.mature_url}"
+        else
+            echo "Mature file {output.mature} already exists, skipping."
+        fi
+        """
+
+
+########################################
+# ORIGINAL PIPELINE (unchanged)
+########################################
+
+rule all:
+    input:
+        expand("{outdir}/multiqc_report.html", outdir=config["directories"]["multiqc_output"]),
+        expand("{outdir}/hsa_v2.1.ebwt", outdir=config["directories"]["mirdeep2_ref"]),
+        f"{config['directories']['mirdeep2_ref']}/hsa.fa",
+        expand("{outdir}/{sample}_mapped.fa", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/{sample}_mapped_vs_hsa.arf", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        f"{config['directories']['mirdeep2_ref']}/miRBase_mature_hsa_v22_3.fa",
+        f"{config['directories']['mirdeep2_ref']}/miRBase_hairpin_hsa_v22_3.fa",
+        expand("{outdir}/result_{sample}.html", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/result_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/survey_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/output_{sample}.mrd", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/expression_{sample}.html", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/error_{sample}.log", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/miRNAs_expressed_all_samples_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/result_{sample}.bed", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/pdfs_{sample}/", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/mirna_results_{sample}/", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        # expand("{outdir}/{sample}_miRDeep2_log.txt", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        "results/mirdeep2/.mirdeep2_outputs_organized.done"
+
+
+rule fastqc:
+    input:
+        fastq=expand("{dir}/{sample}.fastq.gz", dir=config["directories"]["raw_data"], sample=config["samples"])
+    output:
+        html=expand("{outdir}/{sample}_fastqc.html", outdir=config["directories"]["fastqc_output"], sample=config["samples"]),
+        zip=expand("{outdir}/{sample}_fastqc.zip", outdir=config["directories"]["fastqc_output"], sample=config["samples"])
+    params:
+        outdir=config["directories"]["fastqc_output"]
+    shell:
+        """
+        fastqc {input.fastq} --outdir {params.outdir}
+        """
+
+
+rule multiqc:
+    input:
+        lambda wildcards: expand("{outdir}/{sample}_fastqc.zip", outdir=config["directories"]["fastqc_output"], sample=config["samples"])
+    output:
+        report=config["directories"]["multiqc_output"] + "/multiqc_report.html"
+    params:
+        indir=config["directories"]["fastqc_output"],
+        outdir=config["directories"]["multiqc_output"]
+    shell:
+        """
+        multiqc {params.indir} --filename {output.report} -f
+        """
+
+
+
+rule prepare_mirdeep_ref:
+    input:
+        ref_file=config["files"]["ref_file"]  # now produced by download_genome if missing
+    output:
+        hsa_fa = f"{config['directories']['mirdeep2_ref']}/hsa.fa",
+        index_done = touch(f"{config['directories']['mirdeep2_ref']}/hsa_v2.1.ebwt"),
+        ready_signal = touch(f"{config['directories']['mirdeep2_ref']}/hsa_v2.ready")
+    shell:
+        """
+        cp {input.ref_file} {output.hsa_fa}
+        cd data/ref/mirdeep2
+        bowtie-build hsa.fa hsa_v2
+        touch hsa_v2.ready
+        """
+
+
+
+rule process_miRNA_files:
+    input:
+        hairpin_fa=f"{config['directories']['hsa_ref']}/{config['files']['hairpin']}",   # now produced by download_mirbase
+        mature_fa=f"{config['directories']['hsa_ref']}/{config['files']['mature']}",    # now produced by download_mirbase
+        hsa_fa=f"{config['directories']['mirdeep2_ref']}/hsa.fa"
+    output:
+        mature_fa_clean=f"{config['directories']['mirdeep2_ref']}/miRBase_mature_hsa_v22_3.fa",
+        hairpin_fa_clean=f"{config['directories']['mirdeep2_ref']}/miRBase_hairpin_hsa_v22_3.fa",
+        hsa2_fa=f"{config['directories']['mirdeep2_ref']}/hsa2.fa"
+    shell:
+        """
+        cp {input.hairpin_fa} {input.mature_fa} {config[directories][mirdeep2_ref]}/
+
+        # Navigate to target directory
+        cd {config[directories][mirdeep2_ref]}
+
+        # Clean up files with Perl for renaming
+        perl -plane 's/\\s+.+$//' < hairpin.fa > miRBase_hairpin_hsa_v22_2.fa
+        perl -plane 's/\\s+.+$//' < mature.fa > miRBase_mature_hsa_v22_2.fa
+
+        # Clean hsa.fa to create hsa2.fa
+        perl -plane 's/\\s+.+$//' < hsa.fa > hsa2.fa
+
+        # Extract miRNAs and clean further
+        extract_miRNAs.pl miRBase_mature_hsa_v22_2.fa hsa > miRBase_mature_hsa_v22_3.fa
+        extract_miRNAs.pl miRBase_hairpin_hsa_v22_2.fa hsa > miRBase_hairpin_hsa_v22_3.fa
+        """
+
+
+rule mirdeep2_mapper:
+    input:
+        fastq_files=expand("{dir}/{sample}.fastq.gz", dir=config["directories"]["raw_data"], sample=config["samples"]),
+        ref_index_ready=f"{config['directories']['mirdeep2_ref']}/hsa_v2.ready"
+    output:
+        fa=expand("{outdir}/{sample}_mapped.fa", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        arf=expand("{outdir}/{sample}_mapped_vs_hsa.arf", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"])
+    params:
+        outdir=config["directories"]["mirdeep2_map"],
+        ref_index=config["directories"]["mirdeep2_ref"] + "/hsa_v2",
+        adapter_seq="TGGAATTCTCGGGTGCCAAGG",
+        read_length=18,
+        cores=16
+    shell:
+        """
+        for file in {input.fastq_files}; do
+            bname=$(basename ${{file}} '.fastq.gz')
+            TMP_UNZIPPED={params.outdir}/${{bname}}.fastq
+            gunzip -c ${{file}} > $TMP_UNZIPPED
+            echo "Processing file: ${{file}}"
+            echo "First few lines of $TMP_UNZIPPED:"
+            head -n 8 $TMP_UNZIPPED
+            mapper.pl $TMP_UNZIPPED -e -h -i -j \\
+                -k {params.adapter_seq} \\
+                -l {params.read_length} \\
+                -m -p {params.ref_index} \\
+                -s {params.outdir}/${{bname}}_mapped.fa \\
+                -t {params.outdir}/${{bname}}_mapped_vs_hsa.arf \\
+                -v -o {params.cores}
+            rm $TMP_UNZIPPED
+        done
+        """
+
+
+rule run_miRDeep2:
+    input:
+        fa_files=expand("{dir}/{sample}_mapped.fa", dir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        arf_files=expand("{dir}/{sample}_mapped_vs_hsa.arf", dir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        hsa2_fa=f"{config['directories']['mirdeep2_ref']}/hsa2.fa",
+        mature_fa=f"{config['directories']['mirdeep2_ref']}/miRBase_mature_hsa_v22_3.fa",
+        hairpin_fa=f"{config['directories']['mirdeep2_ref']}/miRBase_hairpin_hsa_v22_3.fa"
+    output:
+        expand("{outdir}/result_{sample}.html", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/result_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/survey_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/output_{sample}.mrd", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/expression_{sample}.html", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/error_{sample}.log", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/miRNAs_expressed_all_samples_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/result_{sample}.bed", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/pdfs_{sample}/", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+        expand("{outdir}/mirna_results_{sample}/", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"])
+    params:
+        species="Human"
+    shell:
+        """
+
+        for f in {input.fa_files}; do
+            bname=$(basename ${{f}} '_mapped.fa')
+            echo "Processing: ${{f}} $bname {config[directories][mirdeep2_map]}/${{bname}}_mapped_vs_hsa.arf"
+            echo "Running: miRDeep2.pl ${{f}} {input.hsa2_fa} {config[directories][mirdeep2_map]}/${{bname}}_mapped_vs_hsa.arf \\
+                {input.mature_fa} none {input.hairpin_fa} -t {params.species} -P -v -z $bname 2> {config[directories][mirdeep2_map]}/${{bname}}_miRDeep2_log.txt"
+            miRDeep2.pl ${{f}} {input.hsa2_fa} {config[directories][mirdeep2_map]}/${{bname}}_mapped_vs_hsa.arf \\
+                {input.mature_fa} none {input.hairpin_fa} -t {params.species} -P -v -z $bname 2> {config[directories][mirdeep2_map]}/${{bname}}_miRDeep2_log.txt
+            
+        done
+        """
+
+
+
+
+# rule organize_mirdeep2_outputs:
+#     input:
+#         expand("{outdir}/result_{sample}.html", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/result_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/survey_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/output_{sample}.mrd", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/expression_{sample}.html", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/error_{sample}.log", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/miRNAs_expressed_all_samples_{sample}.csv", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/result_{sample}.bed", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/pdfs_{sample}/", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"]),
+#         expand("{outdir}/mirna_results_{sample}/", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"])
+#         # expand("{outdir}/{sample}_miRDeep2_log.txt", outdir=config["directories"]["mirdeep2_map"], sample=config["samples"])
+#     output:
+#         touch("results/mirdeep2/.mirdeep2_outputs_organized.done")
+#     shell:
+#         """
+#         mv dir_prepare* results/mirdeep2/ 2>/dev/null || true
+#         mv mirna_results* results/mirdeep2/ 2>/dev/null || true
+#         mv pdfs* results/mirdeep2/ 2>/dev/null || true
+#         mv result_* results/mirdeep2/ 2>/dev/null || true
+#         mv miRNAs_expressed_all_samples*.csv results/mirdeep2/ 2>/dev/null || true
+#         mv error*.log results/mirdeep2/ 2>/dev/null || true
+#         mv expression*.html results/mirdeep2/ 2>/dev/null || true
+#         mv expression_analyses results/mirdeep2/ 2>/dev/null || true
+#         mv mapper_logs results/mirdeep2/ 2>/dev/null || true
+#         mv mirdeep_runs results/mirdeep2/ 2>/dev/null || true
+
+#         touch results/mirdeep2/.mirdeep2_outputs_organized.done
+#         """
+
+
+
+rule organize_mirdeep2_outputs:
+    input:
+        # Something that proves miRDeep2 ran for every sample
+        expand(
+            "results/mirdeep2/{sample}_miRDeep2_log.txt",
+            sample=config["samples"]
+        )
+    output:
+        done = "results/mirdeep2/.mirdeep2_outputs_organized.done"
+    params:
+        # space-separated list of sample names
+        samples = " ".join(config["samples"])
+    shell:
+        r"""
+        mkdir -p results/mirdeep2
+
+        # For each sample, move/rename timestamped files into canonical names
+        for s in {params.samples}; do
+            echo "Organizing outputs for sample: $s"
+
+            # result html/csv/bed
+            if ls result_*"$s".html >/dev/null 2>&1; then
+                mv result_*"$s".html results/mirdeep2/result_"$s".html
+            fi
+            if ls result_*"$s".csv >/dev/null 2>&1; then
+                mv result_*"$s".csv  results/mirdeep2/result_"$s".csv
+            fi
+            if ls result_*"$s".bed >/dev/null 2>&1; then
+                mv result_*"$s".bed  results/mirdeep2/result_"$s".bed
+            fi
+
+            # survey
+            if ls survey_*"$s".csv >/dev/null 2>&1; then
+                mv survey_*"$s".csv  results/mirdeep2/survey_"$s".csv
+            fi
+
+            # expression HTML
+            if ls expression_*"$s".html >/dev/null 2>&1; then
+                mv expression_*"$s".html \
+                   results/mirdeep2/expression_"$s".html
+            fi
+
+            # expressed miRNAs table
+            if ls miRNAs_expressed_all_samples_*"$s".csv >/dev/null 2>&1; then
+                mv miRNAs_expressed_all_samples_*"$s".csv \
+                   results/mirdeep2/miRNAs_expressed_all_samples_"$s".csv
+            fi
+
+            # mrd file
+            if ls output_*"$s".mrd >/dev/null 2>&1; then
+                mv output_*"$s".mrd results/mirdeep2/output_"$s".mrd
+            fi
+
+            # mrd file
+            if ls error_*"$s".log >/dev/null 2>&1; then
+                mv error_*"$s".log results/mirdeep2/error_"$s".log
+            fi
+
+
+            # pdfs + mirna_results dirs
+            if ls -d pdfs_*"$s" >/dev/null 2>&1; then
+                mv pdfs_*"$s"          results/mirdeep2/pdfs_"$s"
+            fi
+            if ls -d mirna_results_*"$s" >/dev/null 2>&1; then
+                mv mirna_results_*"$s" results/mirdeep2/mirna_results_"$s"
+            fi
+        done
+
+        # Optional: also move helper dirs
+        mv dir_prepare*        results/mirdeep2/ 2>/dev/null || true
+        mv expression_analyses results/mirdeep2/ 2>/dev/null || true
+        mv mapper_logs         results/mirdeep2/ 2>/dev/null || true
+        mv mirdeep_runs        results/mirdeep2/ 2>/dev/null || true
+
+        touch {output.done}
+        """
+

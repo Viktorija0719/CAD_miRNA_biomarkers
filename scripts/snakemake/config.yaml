@@ -1,0 +1,27 @@
+samples:
+  - miRNA_S8141Nr19.1
+  - miRNA_S8141Nr20.1
+  - miRNA_S8141Nr48.1
+  - miRNA_S8141Nr49.1
+  - miRNA_S8141Nr50.1
+
+directories:
+  raw_data: "data/raw"
+  fastqc_output: "results/fastqc"
+  multiqc_output: "results/multiqc"
+  mirdeep2_ref: "data/ref/mirdeep2"
+  mirdeep2_map: "results/mirdeep2"
+  mirdeep2_final: "results/mirdeep2"
+  hsa_ref: "data/ref"
+
+files:
+  ref_file: "data/ref/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+  hairpin: "hairpin.fa"
+  mature: "mature.fa"
+
+urls:
+  ref_file: "ftp://ftp.ensembl.org/pub/release-109/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz"
+  hairpin:  "https://mirbase.org/download/hairpin.fa"
+  mature:   "https://mirbase.org/download/mature.fa"
+
+
